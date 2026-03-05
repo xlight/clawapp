@@ -4,6 +4,7 @@
 
 import { getTheme, setTheme } from './theme.js'
 import { getLang, setLang, t, onLangChange } from './i18n.js'
+import { requestPermission, isSupported as isNotifySupported } from './notify.js'
 
 const LAYOUT_KEY = 'clawapp-layout'
 
@@ -90,6 +91,11 @@ export function showSettings() {
       </div>
 
       <div class="settings-section" style="margin-top:16px">
+        <div class="settings-label">${t('settings.notify')}</div>
+        <div id="notify-section">${renderNotifySection()}</div>
+      </div>
+
+      <div class="settings-section" style="margin-top:16px">
         <button class="settings-disconnect-btn" id="settings-disconnect">
           ${t('settings.disconnect')}
         </button>
@@ -150,6 +156,16 @@ export function showSettings() {
     }
   })
 
+  // 通知按鈕
+  const notifyBtn = panel.querySelector('#notify-enable-btn')
+  if (notifyBtn) {
+    notifyBtn.onclick = async () => {
+      const permission = await requestPermission()
+      const section = panel.querySelector('#notify-section')
+      if (section) section.innerHTML = renderNotifySection()
+    }
+  }
+
   // 断开连接
   panel.querySelector('#settings-disconnect').onclick = () => {
     closeSettings()
@@ -163,4 +179,22 @@ export function showSettings() {
 function closeSettings() {
   document.querySelector('.settings-overlay')?.remove()
   document.querySelector('.settings-panel')?.remove()
+}
+
+/**
+ * 根据当前通知权限状态渲染对应 HTML 片段
+ */
+function renderNotifySection() {
+  if (!isNotifySupported) {
+    return `<span class="settings-notify-status muted">${t('settings.notify.unsupported')}</span>`
+  }
+  const perm = Notification.permission
+  if (perm === 'granted') {
+    return `<span class="settings-notify-status ok">✓ ${t('settings.notify.granted')}</span>`
+  }
+  if (perm === 'denied') {
+    return `<span class="settings-notify-status warn">${t('settings.notify.denied')}</span>`
+  }
+  // 'default' — 未请求过
+  return `<button class="settings-toggle" id="notify-enable-btn">${t('settings.notify.enable')}</button>`
 }

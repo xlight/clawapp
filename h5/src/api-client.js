@@ -332,6 +332,15 @@ export class WsClient {
     return this.request('chat.history', { sessionKey, limit })
   }
 
+  async notifyHistory() {
+    if (!this._baseUrl || !this._sid) return []
+    try {
+      const res = await fetch(`${this._baseUrl}/api/notify-history?sid=${encodeURIComponent(this._sid)}`)
+      const data = await res.json()
+      return data.ok ? (data.items || []) : []
+    } catch { return [] }
+  }
+
   chatAbort(sessionKey, runId) {
     const params = { sessionKey }
     if (runId) params.runId = runId

@@ -498,6 +498,15 @@
   color: #fff;
 }
 
+/* 通知状态 */
+.settings-notify-status {
+  font-size: 13px;
+  line-height: 1.5;
+}
+.settings-notify-status.ok   { color: var(--primary, #4caf50); }
+.settings-notify-status.warn { color: var(--danger, #e94560); }
+.settings-notify-status.muted { color: var(--text-secondary, #888); }
+
 /* 关于区块 */
 .settings-about {
   margin-top: 24px;

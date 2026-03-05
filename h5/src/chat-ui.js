@@ -5,6 +5,7 @@ import { initCommands, showCommands } from './commands.js'
 import { t, formatRelativeTime } from './i18n.js'
 import { initSettings, showSettings } from './settings.js'
 import { saveMessage, saveMessages, getLocalMessages, clearSessionMessages, isStorageAvailable, saveSessionInfo } from './message-db.js'
+import { requestPermission, showNotification, isSupported as isNotifySupported } from './notify.js'
 import { initSessionPicker, setPickerSessionKey, showSessionPicker } from './session-picker.js'
 
 const STORAGE_SESSION_KEY = 'clawapp-session-key'
@@ -242,6 +243,11 @@ export function initChatUI(onSettings) {
   initMedia(_previewBar, updateSendState)
   initSettings(onSettings)
 
+  // 页面就绪后静默检查通知权限（已 granted 则无感，'default' 则不主动弹窗——由用户在设置里开启）
+  if (isNotifySupported && Notification.permission === 'granted') {
+    // 已授权，无需任何操作
+  }
+
   document.getElementById('settings-btn').onclick = () => showSettings()
   document.getElementById('session-title').onclick = () => showSessionPicker()
   initSessionPicker({
@@ -471,6 +477,37 @@ function handleEvent(msg) {
   const { event, payload } = msg
   if (event === 'chat') handleChatEvent(payload)
   else if (event === 'agent') handleAgentEvent(payload)
+  else if (event === 'system.notify') handleSystemNotify(payload)
+}
+
+/** 处理 OpenClaw Gateway 主动推送的 system.notify 事件 */
+function handleSystemNotify(payload) {
+  if (!payload) return
+  const title = payload.title || 'OpenClaw'
+  const body = payload.body || payload.message || payload.text || ''
+  const sentAt = payload._sentAt ? new Date(payload._sentAt) : new Date()
+  appendSystemNotifyItem(title, body, sentAt)
+  const tag = payload.tag || 'system-notify'
+  const opts = { body, tag, renotify: true }
+  if (payload.icon) opts.icon = payload.icon
+  if (payload.data) opts.data = payload.data
+  showNotification(title, opts)
+}
+
+/** 实时 SSE 插入一条居中系统通知行 */
+function appendSystemNotifyItem(title, body, sentAt) {
+  if (!_messagesEl) return
+  const sentAtMs = sentAt instanceof Date ? sentAt.getTime() : (Number(sentAt) || Date.now())
+  if (_messagesEl.querySelector(`.system-notify-item[data-sent-at="${sentAtMs}"]`)) return
+  const wrapper = document.createElement('div')
+  wrapper.className = 'msg system-notify-item'
+  wrapper.dataset.sentAt = sentAtMs
+  const timeStr = formatTime(new Date(sentAtMs))
+  const titleHtml = title ? `<span class="sni-title">${escapeText(title)}</span>` : ''
+  const bodyHtml = body ? `<span class="sni-body">${escapeText(body)}</span>` : ''
+  wrapper.innerHTML = `<div class="sni-pill">🔔 ${titleHtml}${titleHtml && bodyHtml ? '：' : ''}${bodyHtml}<span class="sni-time">${timeStr}</span></div>`
+  _messagesEl.insertBefore(wrapper, _typingEl)
+  scrollToBottom()
 }
 
 function handleChatEvent(payload) {
@@ -563,6 +600,12 @@ function handleChatEvent(payload) {
     }
     _lastFinalSig = sig
     _lastFinalAt = now
+
+    // 页面在后台时（如手机熄屏、切换到其他 App）弹出浏览器通知
+    if (document.hidden && isNotifySupported && Notification.permission === 'granted' && (finalText || hasMedia)) {
+      const preview = finalText ? (finalText.length > 80 ? finalText.slice(0, 80) + '…' : finalText) : t('notify.media')
+      showNotification(t('notify.ai.reply'), { body: preview, tag: 'ai-reply', renotify: false })
+    }
 
     resetStreamState()
     processMessageQueue()
@@ -817,6 +860,8 @@ function appendUserMessage(text, attachments, msgTime) {
   
   wrapper.appendChild(bubble)
   wrapper.appendChild(time)
+  const ts = (msgTime || new Date()).getTime()
+  wrapper.dataset.msgTime = ts
   _messagesEl.insertBefore(wrapper, _typingEl)
   scrollToBottom()
 }
@@ -842,6 +887,7 @@ function appendAiMessage(text, msgTime, images, videos, audios, files) {
   
   wrapper.appendChild(bubble)
   wrapper.appendChild(time)
+  wrapper.dataset.msgTime = (msgTime || new Date()).getTime()
   _messagesEl.insertBefore(wrapper, _typingEl)
   scrollToBottom()
 }
@@ -1043,7 +1089,7 @@ export async function loadHistory() {
   if (!_sessionKey) return
   const hasExisting = _messagesEl?.querySelector('.msg')
 
-  // 首次加载：显示本地缓存
+  // 首次加载：显示本地缓存（快速展示，不等待服务端）
   if (!hasExisting && isStorageAvailable()) {
     const local = await getLocalMessages(_sessionKey, 200)
     if (local.length) {
@@ -1057,24 +1103,29 @@ export async function loadHistory() {
     }
   }
 
-  // 从服务端拉取
+  // 从服务端并行拉取：聊天历史 + 通知历史
   if (!wsClient.gatewayReady) return
   try {
-    const result = await wsClient.chatHistory(_sessionKey, 200)
-    if (!result?.messages?.length) {
+    const [chatResult, notifyItems] = await Promise.all([
+      wsClient.chatHistory(_sessionKey, 200),
+      wsClient.notifyHistory(),
+    ])
+
+    if (!chatResult?.messages?.length) {
       if (!_messagesEl.querySelector('.msg')) { clearMessages(); appendSystemMessage(t('chat.no.messages')) }
+      if (notifyItems.length) insertNotifyItemsInOrder(notifyItems)
       return
     }
     // 去重
-    const deduped = dedupeHistory(result.messages)
+    const deduped = dedupeHistory(chatResult.messages)
     // 算 hash，没变就跳过渲染
     const hash = deduped.map(m => `${m.role}:${m.text?.length || 0}`).join('|')
-    if (hash === _lastHistoryHash && hasExisting) return
+    if (hash === _lastHistoryHash && hasExisting && !notifyItems.length) return
     _lastHistoryHash = hash
 
     // 有待发送/发送中的本地消息时，不要全量重绘，避免覆盖本地乐观渲染
     if (hasExisting && (_isSending || _isStreaming || _messageQueue.length > 0)) {
-      saveMessages(result.messages.map(m => {
+      saveMessages(chatResult.messages.map(m => {
         const c = extractContent(m)
         return { id: m.id || uuid(), sessionKey: _sessionKey, role: m.role, content: c?.text || '', timestamp: m.timestamp || Date.now() }
       }))
@@ -1090,7 +1141,9 @@ export async function loadHistory() {
         appendAiMessage(msg.text, msgTime, msg.images, msg.videos, msg.audios, msg.files)
       }
     })
-    saveMessages(result.messages.map(m => {
+    // 将通知条按时间插到对应位置
+    insertNotifyItemsInOrder(notifyItems)
+    saveMessages(chatResult.messages.map(m => {
       const c = extractContent(m)
       return { id: m.id || uuid(), sessionKey: _sessionKey, role: m.role, content: c?.text || '', timestamp: m.timestamp || Date.now() }
     }))
@@ -1134,6 +1187,41 @@ function clearMessages() {
   if (!_messagesEl) return
   const children = Array.from(_messagesEl.children)
   children.forEach(child => { if (child !== _typingEl) _messagesEl.removeChild(child) })
+}
+
+/**
+ * 按时间顺序注入通知条到当前消息列表中
+ * @param {Array<{title,body,_sentAt}>} items 服务端返回的通知列表
+ */
+function insertNotifyItemsInOrder(items) {
+  if (!_messagesEl || !items?.length) return
+  const sorted = [...items].sort((a, b) => (a._sentAt || 0) - (b._sentAt || 0))
+
+  // 收集所有带 data-msg-time 的消息元素（用于找插入位置）
+  const msgEls = Array.from(_messagesEl.children).filter(
+    el => el !== _typingEl && !el.classList.contains('system-notify-item') && el.dataset.msgTime
+  )
+
+  for (const n of sorted) {
+    const sentAtMs = n._sentAt || 0
+    const title = n.title || 'OpenClaw'
+    const body = n.body || n.message || n.text || ''
+
+    // DOM 内去重
+    if (sentAtMs && _messagesEl.querySelector(`.system-notify-item[data-sent-at="${sentAtMs}"]`)) continue
+
+    const wrapper = document.createElement('div')
+    wrapper.className = 'msg system-notify-item'
+    if (sentAtMs) wrapper.dataset.sentAt = sentAtMs
+    const timeStr = sentAtMs ? formatTime(new Date(sentAtMs)) : ''
+    const titleHtml = title ? `<span class="sni-title">${escapeText(title)}</span>` : ''
+    const bodyHtml = body ? `<span class="sni-body">${escapeText(body)}</span>` : ''
+    wrapper.innerHTML = `<div class="sni-pill">🔔 ${titleHtml}${titleHtml && bodyHtml ? '：' : ''}${bodyHtml}<span class="sni-time">${timeStr}</span></div>`
+
+    // 找第一个时间戳比它更晚的消息元素，插到它前面
+    const after = sentAtMs ? msgEls.find(el => Number(el.dataset.msgTime) > sentAtMs) : null
+    _messagesEl.insertBefore(wrapper, after || _typingEl)
+  }
 }
 
 export function abortChat() {

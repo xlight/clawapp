@@ -20,3 +20,7 @@ android/app/release.keystore
 # Electron build outputs
 electron/release/
 electron/node_modules/
+
+# node-device-key and notify history files
+server/.node-device-key.json
+server/.notify-history.json

@@ -53,6 +53,24 @@ const deviceKey = (() => {
 })();
 const devicePrivateKey = createPrivateKey(deviceKey.privateKeyPem);
 
+// Ed25519 Node 设备密钥（以 role:node 接受 system.notify 指令）
+const NODE_DEVICE_KEY_PATH = join(__dirname, '.node-device-key.json');
+const nodeDeviceKey = (() => {
+  if (existsSync(NODE_DEVICE_KEY_PATH)) {
+    return JSON.parse(readFileSync(NODE_DEVICE_KEY_PATH, 'utf8'));
+  }
+  const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+  const pubRaw = publicKey.export({ type: 'spki', format: 'der' }).subarray(-32);
+  const dk = {
+    deviceId: createHash('sha256').update(pubRaw).digest('hex'),
+    publicKey: pubRaw.toString('base64url'),
+    privateKeyPem: privateKey.export({ type: 'pkcs8', format: 'pem' }),
+  };
+  writeFileSync(NODE_DEVICE_KEY_PATH, JSON.stringify(dk, null, 2));
+  return dk;
+})();
+const nodeDevicePrivateKey = createPrivateKey(nodeDeviceKey.privateKeyPem);
+
 // 日志
 const log = {
   info: (msg, ...args) => console.log(`[INFO] ${new Date().toISOString()} ${msg}`, ...args),
@@ -112,6 +130,37 @@ function createConnectFrame(nonce) {
       device: { id: deviceKey.deviceId, publicKey: deviceKey.publicKey, signedAt, nonce, signature },
       locale: 'zh-CN',
       userAgent: 'OpenClaw-Mobile-Proxy/1.0.0',
+    },
+  };
+}
+
+/**
+ * 生成 Node 角色 connect 握手帧
+ * mode=node 以支持 system.notify 指令
+ */
+function createNodeConnectFrame(nonce) {
+  const signedAt = Date.now();
+  const credential = CONFIG.gatewayPassword || CONFIG.gatewayToken;
+  const payload = ['v2', nodeDeviceKey.deviceId, 'node-host', 'node', 'node', '', String(signedAt), credential, nonce || ''].join('|');
+  const signature = ed25519Sign(null, Buffer.from(payload, 'utf8'), nodeDevicePrivateKey).toString('base64url');
+  const auth = CONFIG.gatewayPassword
+    ? { password: CONFIG.gatewayPassword }
+    : { token: CONFIG.gatewayToken };
+  return {
+    type: 'req',
+    id: `connect-node-${randomUUID()}`,
+    method: 'connect',
+    params: {
+      minProtocol: 3, maxProtocol: 3,
+      client: { id: 'node-host', version: '1.0.0', platform: 'linux', mode: 'node', displayName: 'ClawApp' },
+      role: 'node',
+      scopes: [],
+      caps: ['system'],
+      commands: ['system.notify'],
+      auth,
+      device: { id: nodeDeviceKey.deviceId, publicKey: nodeDeviceKey.publicKey, signedAt, nonce, signature },
+      locale: 'zh-CN',
+      userAgent: 'ClawApp-Node/1.0.0',
     },
   };
 }
@@ -232,6 +281,21 @@ function handleUpstreamMessage(sid, rawData) {
         }
       }
 
+      // node 设备配对请求 → 自动审批（允许 ClawApp node 设备接受 system.notify）
+      if (msg.event === 'device.pair.requested' && msg.payload?.deviceId === nodeDeviceKey.deviceId) {
+        const requestId = msg.payload.requestId;
+        log.info(`[node] 自动审批 node 设备配对: requestId=${requestId}`);
+        if (session.upstream?.readyState === WebSocket.OPEN) {
+          session.upstream.send(JSON.stringify({
+            type: 'req',
+            id: `auto-approve-${randomUUID()}`,
+            method: 'device.pair.approve',
+            params: { requestId },
+          }));
+        }
+        return;
+      }
+
       log.debug(`SSE 推送 [${sid}] event=${msg.event} stream=${msg.payload?.stream} phase=${msg.payload?.data?.phase} state=${msg.payload?.state}`);
       sseWrite(session, 'message', msg);
     }
@@ -332,6 +396,272 @@ function connectToGateway(sid) {
         upstream.ping();
       }
     }, 30000);
+  });
+}
+
+// ==================== Node 客户端（system.notify 接收端）====================
+
+let _nodeWs = null;
+let _nodeReady = false;
+let _nodeReconnectTimer = null;
+
+// -------- 后台 Operator 连接（专门用于自动审批 node 设备配对）--------
+let _bgOpWs = null;
+let _bgOpReady = false;
+let _bgOpReconnectTimer = null;
+let _bgOpReqSeq = 0;
+const _bgOpPending = new Map(); // id → {resolve, reject, timer}
+
+function bgOpRequest(method, params) {
+  return new Promise((resolve, reject) => {
+    if (!_bgOpReady || !_bgOpWs || _bgOpWs.readyState !== WebSocket.OPEN) {
+      return reject(new Error('bgOp not ready'));
+    }
+    const id = `bgop-${++_bgOpReqSeq}`;
+    const timer = setTimeout(() => { _bgOpPending.delete(id); reject(new Error('bgOp timeout')); }, 10000);
+    _bgOpPending.set(id, { resolve, reject, timer });
+    _bgOpWs.send(JSON.stringify({ type: 'req', id, method, params }));
+  });
+}
+
+async function tryApproveNodeDevice() {
+  try {
+    const result = await bgOpRequest('device.pair.list', {});
+    const pending = (result?.pending || []);
+    const nodeReq = pending.find(r => r.deviceId === nodeDeviceKey.deviceId);
+    if (nodeReq) {
+      log.info(`[node-setup] 审批 node 设备 requestId=${nodeReq.requestId}`);
+      await bgOpRequest('device.pair.approve', { requestId: nodeReq.requestId });
+      log.info('[node-setup] 审批完成，1s 后触发 node 重连');
+      if (_nodeReconnectTimer) clearTimeout(_nodeReconnectTimer);
+      _nodeReconnectTimer = setTimeout(startNodeClient, 1000);
+    }
+  } catch (e) {
+    log.warn('[node-setup] tryApproveNodeDevice 失败:', e.message);
+  }
+}
+
+function startBgOperator() {
+  if (_bgOpReconnectTimer) { clearTimeout(_bgOpReconnectTimer); _bgOpReconnectTimer = null; }
+  log.info('[node-setup] 启动后台 operator 连接...');
+  const ws = new WebSocket(CONFIG.gatewayUrl, {
+    headers: { 'Origin': CONFIG.gatewayUrl.replace('ws://', 'http://').replace('wss://', 'https://') },
+  });
+  _bgOpWs = ws;
+  _bgOpReady = false;
+
+  let connTimer = null;
+  ws.on('open', () => {
+    connTimer = setTimeout(() => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(createConnectFrame('')));
+    }, 500);
+  });
+
+  ws.on('message', (data) => {
+    let msg;
+    try { msg = JSON.parse(data.toString()); } catch { return; }
+
+    if (msg.type === 'event' && msg.event === 'connect.challenge') {
+      if (connTimer) { clearTimeout(connTimer); connTimer = null; }
+      ws.send(JSON.stringify(createConnectFrame(msg.payload?.nonce || '')));
+      return;
+    }
+
+    if (msg.type === 'res' && String(msg.id).startsWith('connect-')) {
+      if (msg.ok) {
+        _bgOpReady = true;
+        log.info('[node-setup] 后台 operator 就绪，检查 node 配对状态...');
+        tryApproveNodeDevice();
+      } else {
+        log.warn('[node-setup] 后台 operator connect 失败:', msg.error?.message);
+      }
+      return;
+    }
+
+    if (msg.type === 'res') {
+      const cb = _bgOpPending.get(msg.id);
+      if (cb) {
+        _bgOpPending.delete(msg.id);
+        clearTimeout(cb.timer);
+        if (msg.ok) cb.resolve(msg.payload);
+        else cb.reject(new Error(msg.error?.message || 'error'));
+      }
+      return;
+    }
+
+    // 实时捕获 device.pair.requested
+    if (msg.type === 'event' && msg.event === 'device.pair.requested' &&
+        msg.payload?.deviceId === nodeDeviceKey.deviceId) {
+      const requestId = msg.payload.requestId;
+      log.info(`[node-setup] 实时审批 node 配对: ${requestId}`);
+      bgOpRequest('device.pair.approve', { requestId })
+        .then(() => {
+          log.info('[node-setup] 实时审批完成，1s 后 node 重连');
+          if (_nodeReconnectTimer) clearTimeout(_nodeReconnectTimer);
+          _nodeReconnectTimer = setTimeout(startNodeClient, 1000);
+        })
+        .catch(e => log.warn('[node-setup] 实时审批失败:', e.message));
+    }
+  });
+
+  ws.on('close', (code) => {
+    if (_bgOpWs === ws) {
+      _bgOpWs = null;
+      _bgOpReady = false;
+      for (const [, cb] of _bgOpPending) { clearTimeout(cb.timer); cb.reject(new Error('bgOp closed')); }
+      _bgOpPending.clear();
+      log.warn(`[node-setup] 后台 operator 关闭 code=${code}，15s 后重连`);
+      _bgOpReconnectTimer = setTimeout(startBgOperator, 15000);
+    }
+  });
+
+  ws.on('error', (err) => log.error('[node-setup] 后台 operator WS 错误:', err.message));
+}
+
+// 全局通知历史（持久化到文件，跨重启/跨设备可用）
+const NOTIFY_HISTORY_PATH = join(__dirname, '.notify-history.json');
+const NOTIFY_HISTORY_MAX = 50;
+const NOTIFY_HISTORY_TTL = 24 * 60 * 60 * 1000; // 保留 24 小时
+
+// 启动时从文件加载
+const _notifyHistory = (() => {
+  try {
+    if (existsSync(NOTIFY_HISTORY_PATH)) {
+      const arr = JSON.parse(readFileSync(NOTIFY_HISTORY_PATH, 'utf8'));
+      const cutoff = Date.now() - NOTIFY_HISTORY_TTL;
+      return Array.isArray(arr) ? arr.filter(n => n.sentAt > cutoff) : [];
+    }
+  } catch {}
+  return [];
+})();
+
+function _saveNotifyHistory() {
+  try {
+    writeFileSync(NOTIFY_HISTORY_PATH, JSON.stringify(_notifyHistory), 'utf8');
+  } catch (e) {
+    log.warn('[notify] 历史写入失败:', e.message);
+  }
+}
+
+/** 广播 system.notify 到所有 SSE 客户端，并持久化历史 */
+function broadcastSystemNotify(payload) {
+  const now = Date.now();
+  _notifyHistory.push({ payload, sentAt: now });
+  // 清理超期
+  const cutoff = now - NOTIFY_HISTORY_TTL;
+  while (_notifyHistory.length > 0 && _notifyHistory[0].sentAt < cutoff) _notifyHistory.shift();
+  if (_notifyHistory.length > NOTIFY_HISTORY_MAX) _notifyHistory.splice(0, _notifyHistory.length - NOTIFY_HISTORY_MAX);
+  _saveNotifyHistory();
+
+  let count = 0;
+  for (const [, session] of sessions) {
+    if (session.sseRes && !session.sseRes.writableEnded) {
+      sseWrite(session, 'message', { type: 'event', event: 'system.notify', payload });
+      count++;
+    }
+  }
+  log.info(`[node] system.notify 广播到 ${count} 个 SSE 连接`);
+}
+
+/** 启动 Node 客户端 */
+function startNodeClient() {
+  if (_nodeReconnectTimer) { clearTimeout(_nodeReconnectTimer); _nodeReconnectTimer = null; }
+
+  log.info(`[node] 连接 Gateway 作为 node 角色...`);
+  const ws = new WebSocket(CONFIG.gatewayUrl, {
+    headers: { 'Origin': CONFIG.gatewayUrl.replace('ws://', 'http://').replace('wss://', 'https://') },
+  });
+  _nodeWs = ws;
+  _nodeReady = false;
+
+  let connectTimer = null;
+
+  ws.on('open', () => {
+    log.info('[node] WS 已连接，等待 challenge...');
+    connectTimer = setTimeout(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        log.info('[node] 未收到 challenge，直接发 connect');
+        ws.send(JSON.stringify(createNodeConnectFrame('')));
+      }
+    }, 500);
+  });
+
+  ws.on('message', (data) => {
+    let msg;
+    try { msg = JSON.parse(data.toString()); } catch { return; }
+
+    // connect.challenge
+    if (msg.type === 'event' && msg.event === 'connect.challenge') {
+      if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
+      ws.send(JSON.stringify(createNodeConnectFrame(msg.payload?.nonce || '')));
+      return;
+    }
+
+    // connect 响应
+    if (msg.type === 'res' && String(msg.id).startsWith('connect-node-')) {
+      if (!msg.ok) {
+        const code = msg.error?.code || '';
+        const errMsg = msg.error?.message || '';
+        log.warn(`[node] connect 失败: ${errMsg} (${code})`);
+        // UNPAIRED → 等待 operator 侧 device.pair.requested 自动审批后重试
+        if (code === 'UNPAIRED' || code === 'NOT_PAIRED' || errMsg.toLowerCase().includes('pair')) {
+          log.info('[node] 等待配对审批，触发后台审批流程...');
+          tryApproveNodeDevice();
+          _nodeReconnectTimer = setTimeout(startNodeClient, 12000); // fallback
+        }
+        return;
+      }
+      _nodeReady = true;
+      log.info(`[node] 就绪，node 设备 ID: ${nodeDeviceKey.deviceId.slice(0, 12)}...`);
+      return;
+    }
+
+    // node.invoke.request → 执行 system.notify
+    if (msg.type === 'event' && msg.event === 'node.invoke.request') {
+      const frame = msg.payload || {};
+      if (!frame.id || !frame.command) return;
+      log.info(`[node] invoke: command=${frame.command}`);
+
+      if (frame.command === 'system.notify') {
+        let params = {};
+        try { params = JSON.parse(frame.paramsJSON || '{}'); } catch {}
+        broadcastSystemNotify({
+          title: params.title || 'OpenClaw',
+          body: params.body || '',
+          sound: params.sound,
+          priority: params.priority,
+          delivery: params.delivery,
+        });
+        // 回复 Gateway
+        ws.send(JSON.stringify({
+          type: 'req',
+          id: `inv-res-${randomUUID()}`,
+          method: 'node.invoke.result',
+          params: { id: frame.id, nodeId: frame.nodeId, ok: true, payload: { ok: true } },
+        }));
+      } else {
+        ws.send(JSON.stringify({
+          type: 'req',
+          id: `inv-res-${randomUUID()}`,
+          method: 'node.invoke.result',
+          params: { id: frame.id, nodeId: frame.nodeId, ok: false, error: { code: 'UNSUPPORTED', message: `not supported: ${frame.command}` } },
+        }));
+      }
+      return;
+    }
+  });
+
+  ws.on('close', (code) => {
+    if (_nodeWs === ws) {
+      _nodeWs = null;
+      _nodeReady = false;
+      log.warn(`[node] 连接关闭 code=${code}，5s 后重连`);
+      _nodeReconnectTimer = setTimeout(startNodeClient, 5000);
+    }
+  });
+
+  ws.on('error', (err) => {
+    log.error('[node] WS 错误:', err.message);
   });
 }
 
@@ -657,6 +987,24 @@ app.post('/api/send', async (req, res) => {
   }
 });
 
+/** GET /api/node-id — 返回 node 设备 ID 供 AI 工具查询 */
+app.get('/api/node-id', (req, res) => {
+  res.json({ ok: true, nodeId: nodeDeviceKey.deviceId, nodeReady: _nodeReady });
+});
+
+/** GET /api/notify-history — 返回最近的 system.notify 历史（供刷新后恢复） */
+app.get('/api/notify-history', (req, res) => {
+  const sid = req.query.sid;
+  if (!sid || !sessions.has(sid)) {
+    return res.status(401).json({ ok: false, error: '无效会话' });
+  }
+  const cutoff = Date.now() - NOTIFY_HISTORY_TTL;
+  const items = _notifyHistory
+    .filter(n => n.sentAt >= cutoff)
+    .map(n => ({ ...n.payload, _sentAt: n.sentAt }));
+  res.json({ ok: true, items });
+});
+
 /** POST /api/disconnect — 断开会话 */
 app.post('/api/disconnect', (req, res) => {
   const { sid } = req.body || {};
@@ -705,7 +1053,11 @@ const server = createServer(app);
 server.listen(CONFIG.port, () => {
   log.info(`代理服务端已启动: http://0.0.0.0:${CONFIG.port}`);
   log.info(`架构: 手机 ←SSE+POST→ 代理服务端 ←WS→ Gateway(${CONFIG.gatewayUrl})`);
-  log.info(`设备 ID: ${deviceKey.deviceId.slice(0, 12)}...`);
+  log.info(`operator 设备 ID: ${deviceKey.deviceId.slice(0, 12)}...`);
+  log.info(`node 设备 ID: ${nodeDeviceKey.deviceId.slice(0, 12)}... (system.notify 接收端)`);
+  // 先启动后台 operator（负责审批 node 设备配对），再延迟 2s 启动 node 客户端
+  startBgOperator();
+  setTimeout(startNodeClient, 2000);
 });
 
 // 优雅关闭
@@ -714,6 +1066,10 @@ function shutdown() {
   for (const [sid] of sessions) {
     cleanupSession(sid);
   }
+  if (_nodeWs) { try { _nodeWs.close(); } catch {} }
+  if (_nodeReconnectTimer) { clearTimeout(_nodeReconnectTimer); }
+  if (_bgOpWs) { try { _bgOpWs.close(); } catch {} }
+  if (_bgOpReconnectTimer) { clearTimeout(_bgOpReconnectTimer); }
   server.close(() => {
     log.info('服务已关闭');
     process.exit(0);

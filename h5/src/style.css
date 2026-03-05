@@ -339,6 +339,28 @@ html, body {
   justify-content: flex-start;
 }
 
+/* 系统通知条 —— 居中显示，刷新后依然可见 */
+.msg.system-notify-item {
+  justify-content: center;
+  margin: 4px 0;
+}
+.sni-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 90%;
+  padding: 5px 12px;
+  border-radius: 20px;
+  background: var(--surface-2, rgba(255,255,255,0.08));
+  border: 1px solid var(--border, rgba(255,255,255,0.12));
+  font-size: 13px;
+  color: var(--text-secondary, #aaa);
+  flex-wrap: wrap;
+}
+.sni-title { font-weight: 600; color: var(--text-primary, #eee); }
+.sni-body  { color: var(--text-secondary, #bbb); }
+.sni-time  { font-size: 11px; opacity: 0.6; margin-left: 4px; white-space: nowrap; }
+
 .msg-bubble {
   max-width: 82%;
   padding: 10px 14px;
