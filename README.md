@@ -27,6 +27,10 @@
 
 ---
 
+> 🦀 **[ClawPanel](https://github.com/qingchencloud/clawpanel)** — 内置 AI 助手的 OpenClaw 可视化管理面板（桌面端） | 🇨🇳 **[OpenClaw 汉化版](https://github.com/1186258278/OpenClawChineseTranslation)** — 全中文 CLI + Dashboard
+
+---
+
 <h2 id="about">这是什么？</h2>
 
 [OpenClaw](https://github.com/openclaw/openclaw) 是一个强大的 AI 智能体平台（[中文汉化版](https://github.com/1186258278/OpenClawChineseTranslation)），但它的 Gateway 默认只监听本机（`127.0.0.1:18789`），手机无法直接连接。
