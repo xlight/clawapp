@@ -130,7 +130,7 @@ $script:GatewayUrl = "ws://127.0.0.1:18789"
 $script:GatewayRunning = $false
 
 function Find-OpenClaw {
-    $configPath = Join-Path $env:USERPROFILE ".openclaw" "openclaw.json"
+    $configPath = Join-Path (Join-Path $env:USERPROFILE ".openclaw") "openclaw.json"
 
     if (Test-Path $configPath) {
         Write-Ok "检测到本地 OpenClaw 安装"
@@ -166,7 +166,7 @@ function Find-OpenClaw {
 function Install-OpenClawOptional {
     if ($script:GatewayRunning) { return }
 
-    $configPath = Join-Path $env:USERPROFILE ".openclaw" "openclaw.json"
+    $configPath = Join-Path (Join-Path $env:USERPROFILE ".openclaw") "openclaw.json"
     if (-not (Test-Path $configPath)) {
         Write-Host ""
         Write-Warn "未检测到 OpenClaw，ClawApp 需要 OpenClaw Gateway 才能工作"
@@ -231,7 +231,7 @@ function Build-App {
 }
 
 function Set-Config {
-    $envFile = Join-Path $InstallDir "server" ".env"
+    $envFile = Join-Path (Join-Path $InstallDir "server") ".env"
 
     Write-Host ""
     Write-Info "配置 ClawApp"
