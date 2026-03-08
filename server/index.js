@@ -901,7 +901,18 @@ app.post('/api/connect', async (req, res) => {
   } catch (e) {
     log.error(`会话建立失败 [${sid}]:`, e.message);
     cleanupSession(sid);
-    res.status(502).json({ ok: false, error: e.message });
+    // 将技术错误映射为用户友好提示
+    let userError = e.message;
+    if (/ECONNREFUSED/.test(userError)) {
+      userError = 'OpenClaw 服务未启动，请先在电脑上启动 OpenClaw 后再连接';
+    } else if (/ETIMEDOUT|EHOSTUNREACH/.test(userError)) {
+      userError = '无法连接到 OpenClaw 服务，请检查网络或 Gateway 地址配置';
+    } else if (/连接超时/.test(userError)) {
+      userError = '连接超时，请检查 OpenClaw 是否正在运行';
+    } else if (/握手失败/.test(userError)) {
+      userError = 'Gateway 认证失败，请检查 server/.env 中的 OPENCLAW_GATEWAY_TOKEN 配置';
+    }
+    res.status(502).json({ ok: false, error: userError });
   }
 });
 
