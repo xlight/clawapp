@@ -9,7 +9,7 @@
 #   ./send-prompt.sh --url http://192.168.1.10:4096 --token abc "hello"
 #   echo "从stdin读取" | ./send-prompt.sh -
 #
-# 依赖: bash, curl, python3（均为系统内置，无需额外安装）
+# 依赖: bash, curl, node（项目已要求 Node.js 18+）
 #
 # 环境变量:
 #   PROXY_URL    代理地址，默认读 server/.env 中 PROXY_PORT
@@ -26,7 +26,7 @@ load_env() {
     while IFS='=' read -r key val; do
       [[ "$key" =~ ^[A-Z0-9_]+$ ]] || continue
       val="${val%\"}"; val="${val#\"}"; val="${val%\'}"; val="${val#\'}"
-      eval "ENV_${key}='${val}'"
+      export "ENV_${key}=${val}"
     done < <(grep -E '^[A-Z0-9_]+=' "$ENV_FILE")
   fi
 }
@@ -110,13 +110,12 @@ json_post() {
 }
 
 json_field() {
-  python3 -c "
-import sys, json
-d = json.loads(sys.argv[1])
-for k in sys.argv[2].split('.'):
-    d = d[k]
-print(d)
-" "$1" "$2"
+  node -e "
+    const d = JSON.parse(process.argv[1]);
+    let r = d;
+    process.argv[2].split('.').forEach(k => r = r[k]);
+    console.log(r);
+  " "$1" "$2"
 }
 
 # ==================== 主流程 ====================
@@ -127,7 +126,7 @@ CONN=$(json_post "$URL/api/connect" "{\"token\":\"$TOKEN\"}") || {
   echo "连接失败：服务不可达 $URL" >&2; exit 1
 }
 
-if [[ "$(json_field "$CONN" "ok")" != "True" ]]; then
+if [[ "$(json_field "$CONN" "ok")" != "true" ]]; then
   echo "连接失败：$(json_field "$CONN" "error" 2>/dev/null || echo "未知错误")" >&2; exit 1
 fi
 
@@ -140,18 +139,19 @@ dbg "已连接 sid=$SID sessionKey=$SESSION_KEY"
 trap 'json_post "$URL/api/disconnect" "{\"sid\":\"$SID\"}" >/dev/null 2>&1 || true' EXIT INT TERM
 
 # 2. 发送 prompt
-SEND_BODY=$(python3 -c "
-import json, sys, uuid
-print(json.dumps({
-    'sid': sys.argv[1],
-    'method': 'chat.send',
-    'params': {
-        'sessionKey': sys.argv[2],
-        'message': sys.argv[3],
-        'deliver': False,
-        'idempotencyKey': str(uuid.uuid4()),
+SEND_BODY=$(node -e "
+  const [sid, sessionKey, message] = process.argv.slice(1);
+  const crypto = require('crypto');
+  console.log(JSON.stringify({
+    sid,
+    method: 'chat.send',
+    params: {
+      sessionKey,
+      message,
+      deliver: false,
+      idempotencyKey: crypto.randomUUID(),
     }
-}))
+  }));
 " "$SID" "$SESSION_KEY" "$PROMPT")
 
 dbg "发送 prompt..."
@@ -159,7 +159,7 @@ SEND_RESP=$(json_post "$URL/api/send" "$SEND_BODY") || {
   echo "发送失败：请求出错" >&2; exit 1
 }
 
-if [[ "$(json_field "$SEND_RESP" "ok")" != "True" ]]; then
+if [[ "$(json_field "$SEND_RESP" "ok")" != "true" ]]; then
   echo "发送失败：$(json_field "$SEND_RESP" "error" 2>/dev/null || echo "未知错误")" >&2; exit 1
 fi
 
